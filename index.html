@@ -680,8 +680,8 @@ window.addEventListener('unhandledrejection', function (e) {
     t: 0, offset: 0, playing: false, recording: false, counting: false,
     wallStart: 0, actx: null, master: null, bgmBus: null, bgm: null, videoGain: null, voiceGain: null,
     fired: {}, lastTurn: -2, dirty: true, level: 0,
-    voiceBlob: null, voiceURL: null, voiceLoaded: false, voiceEl: null, voiceSource: null, wantVoice: false,
-    rec: null, chunks: [], mimeType: '', micStream: null, micSrc: null, analyser: null,
+    voiceBlob: null, voiceURL: null, voiceBuf: null, voiceLoaded: false, voiceEl: null, voiceSource: null, wantVoice: false,
+    rec: null, chunks: [], mimeType: '', micStream: null, micSrc: null, analyser: null, recSession: false,
     video: null, videoSource: null, videoURL: null, videoConnected: false,
     bgmVol: 0.55, micVol: 1.0, aiVol: 1.0, tts: true, countdown: true, en: true,
     exporting: false, busy: false, wantTTS: true,
@@ -776,6 +776,55 @@ window.addEventListener('unhandledrejection', function (e) {
     return S.actx;
   }
 
+  /* =========================================================
+     iOS audio unlock
+     Safari only lets an AudioContext start, and only lets a
+     media element be routed to the loudspeaker, from inside a
+     real tap. Everything below is therefore synchronous: no
+     await, no setTimeout between the tap and the sound.
+     ========================================================= */
+  function setAudioSessionType(type) {
+    try {
+      if (navigator.audioSession && navigator.audioSession.type !== type) {
+        navigator.audioSession.type = type;
+      }
+    } catch (e) {}
+  }
+
+  /* "playback" = plain listening (ignores the iPhone silent switch);
+     "play-and-record" = only while the mic is open, so the BGM and the
+     partner's voice keep playing during a take. */
+  function updateAudioSession() {
+    // never leave the record route while the recorder is still flushing its last chunk
+    var flushing = !!(S.rec && S.rec.state !== 'inactive');
+    setAudioSessionType((S.recording || S.recSession || S.counting || flushing) ? 'play-and-record' : 'playback');
+  }
+
+  var silentBuf = null;
+  /* Resume the context and push one silent sample through it. Called inside the
+     tap (or right after the mic opens) it takes the iOS audio session out of
+     "suspended" for good. */
+  function pingAudio() {
+    initAudio();
+    if (!S.actx) return null;
+    try { if (S.actx.state !== 'running' && S.actx.state !== 'closed') S.actx.resume(); } catch (e) {}
+    try {
+      if (!silentBuf) silentBuf = S.actx.createBuffer(1, 1, S.actx.sampleRate);
+      var src = S.actx.createBufferSource();
+      src.buffer = silentBuf;
+      src.connect(S.master);
+      src.start(0);
+      src.onended = function () { try { src.disconnect(); } catch (e) {} };
+    } catch (e) {}
+    return S.actx;
+  }
+
+  function unlockAudioSync() {
+    updateAudioSession();
+    pingAudio();
+    retryFailedAi();
+  }
+
   function noiseBuffer(ctx, seconds, kind) {
     var len = Math.floor(ctx.sampleRate * seconds);
     var buf = ctx.createBuffer(1, len, ctx.sampleRate);
@@ -810,6 +859,34 @@ window.addEventListener('unhandledrejection', function (e) {
     } catch (e) { bad(e); }
   }
 
+  /* Decode the stored bytes of one turn. Safari can refuse to decode while its
+     AudioContext is still suspended, so a failure keeps the bytes and lets
+     retryFailedAi() try again on the next tap instead of falling back to the
+     robot voice for the rest of the session. */
+  function decodeAiKey(key) {
+    var ab = AI.data[key];
+    if (!ab || !S.actx) return Promise.resolve();
+    return new Promise(function (res) {
+      decodeInto(S.actx, ab.slice(0), function (b) {
+        AI.buffers[key] = b;
+        delete AI.failed[key];
+        res(b);
+      }, function () {
+        AI.failed[key] = true;
+        res(null);
+      });
+    });
+  }
+
+  function retryFailedAi() {
+    if (!S.actx || S.actx.state !== 'running') return;
+    var keys = Object.keys(AI.failed);
+    for (var i = 0; i < keys.length; i++) {
+      if (AI.buffers[keys[i]] || !AI.data[keys[i]]) continue;
+      decodeAiKey(keys[i]);
+    }
+  }
+
   function loadAiFor(sc) {
     initAudio();
     if (!S.actx || !sc || !sc.turns) return Promise.resolve();
@@ -824,9 +901,7 @@ window.addEventListener('unhandledrejection', function (e) {
         return r.arrayBuffer();
       }).then(function (ab) {
         AI.data[key] = ab;
-        return new Promise(function (res, rej) {
-          decodeInto(S.actx, ab.slice(0), function (b) { AI.buffers[key] = b; res(b); }, rej);
-        });
+        return decodeAiKey(key);
       }).catch(function () {
         // file:// or offline → the speechSynthesis fallback takes over
         AI.failed[key] = true;
@@ -835,6 +910,19 @@ window.addEventListener('unhandledrejection', function (e) {
       jobs.push(job);
     });
     return Promise.all(jobs);
+  }
+
+  /* true when every spoken line of `sc` can start right now (decoded, or known
+     to be unavailable so the robot voice covers it) */
+  function aiReadyFor(sc) {
+    if (!sc || !sc.turns) return true;
+    for (var i = 0; i < sc.turns.length; i++) {
+      if (!sc.turns[i].mp3) continue;
+      var key = aiKey(sc.id, i);
+      if (AI.buffers[key] || AI.failed[key]) continue;
+      return false;
+    }
+    return true;
   }
 
   function aiBufferFor(i) {
@@ -849,6 +937,15 @@ window.addEventListener('unhandledrejection', function (e) {
       try { n.disconnect(); } catch (e) {}
     });
     aiNodes.length = 0;
+  }
+
+  var voiceNodes = [];
+  function stopVoiceNodes() {
+    voiceNodes.forEach(function (n) {
+      try { n.stop(); } catch (e) {}
+      try { n.disconnect(); } catch (e) {}
+    });
+    voiceNodes.length = 0;
   }
 
   /* Schedules every AI line of the active scenario on the audio clock,
@@ -1720,21 +1817,36 @@ window.addEventListener('unhandledrejection', function (e) {
     return S.t;
   }
 
-  async function play(opts) {
+  /* iOS Safari keeps an AudioContext suspended unless it is started inside the
+     tap itself, so on the normal path (partner's mp3s already decoded) play()
+     runs straight through with no await and the transport starts while the tap
+     is still "live". Only a cold first tap waits for the decodes. */
+  function play(opts) {
     opts = opts || {};
     var primed = (S._primeIdx != null) ? S._primeIdx : -1;
     S._primeIdx = -1;
     initAudio();
-    if (!S.actx) return;
-    try { if (S.actx.state !== 'running') await S.actx.resume(); } catch (e) {}
-    // make sure the partner's real voice files are decoded before the clock starts
-    if (S.mode === 'sample' && S.tts) {
-      await Promise.race([loadAiFor(SC), new Promise(function (r) { setTimeout(r, 3000); })]);
-      try { if (S.actx.state !== 'running') await S.actx.resume(); } catch (e) {}
-    }
+    if (!S.actx) return Promise.resolve();
+    try { if (S.actx.state !== 'running' && S.actx.state !== 'closed') S.actx.resume(); } catch (e) {}
 
     var from = (opts.from != null) ? opts.from : S.t;
     from = clamp(from, 0, Math.max(0, S.duration - 0.02));
+
+    if (S.mode === 'sample' && S.tts && !aiReadyFor(SC)) {
+      // cold start only: the partner's real voice files are still decoding
+      return Promise.race([loadAiFor(SC), new Promise(function (r) { setTimeout(r, 3000); })]).then(function () {
+        pingAudio();
+        startTransport(from, primed, opts);
+      });
+    }
+    startTransport(from, primed, opts);
+    return Promise.resolve();
+  }
+
+  function startTransport(from, primed, opts) {
+    initAudio();
+    if (!S.actx) return;
+    try { if (S.actx.state !== 'running' && S.actx.state !== 'closed') S.actx.resume(); } catch (e) {}
     if (S.playing) stopAudio();
     if (S.bgm) { try { S.bgm.stop(); } catch (e) {} S.bgm = null; }
 
@@ -1760,25 +1872,46 @@ window.addEventListener('unhandledrejection', function (e) {
     }
 
     if (S.mode === 'sample') scheduleAi(from);
-
-    if (opts.voice && S.voiceURL) {
-      var el = ensureVoiceEl();
-      if (!S.voiceLoaded) { el.src = S.voiceURL; S.voiceLoaded = true; }
-      try { el.currentTime = from; } catch (e) {}
-      var pp = el.play();
-      if (pp && pp.catch) pp.catch(function () {});
-    }
+    if (opts.voice) startVoiceMix(from);
 
     updateButtons();
     updateUI(S.t);
   }
 
+  /* The recorded take is played back through the same AudioContext as the BGM
+     and the partner's voice, so all three mix sample-accurately and leave
+     through the loudspeaker together. The <audio> element stays as a fallback
+     for the moment before the take is decoded. */
+  function startVoiceMix(from) {
+    stopVoiceNodes();
+    if (!S.actx) return;
+    if (S.voiceBuf) {
+      if (from >= S.voiceBuf.duration - 0.02) return;  // take already finished
+      try {
+        var src = S.actx.createBufferSource();
+        src.buffer = S.voiceBuf;
+        src.connect(S.voiceGain);
+        src.start(S.actx.currentTime + 0.06, Math.max(0, from));
+        voiceNodes.push(src);
+        return;
+      } catch (e) {}
+    }
+    if (!S.voiceURL) return;
+    var el = ensureVoiceEl();
+    if (!S.voiceLoaded) { el.src = S.voiceURL; S.voiceLoaded = true; }
+    try { el.currentTime = from; } catch (e) {}
+    var pp = el.play();
+    if (pp && pp.catch) pp.catch(function () {});
+  }
+
   function stopAudio() {
     if (S.bgm) { try { S.bgm.stop(); } catch (e) {} S.bgm = null; }
     stopAi();
+    stopVoiceNodes();
     if (S.video && !S.video.paused) { try { S.video.pause(); } catch (e) {} }
     if (S.voiceEl) { try { S.voiceEl.pause(); } catch (e) {} }
     try { if (window.speechSynthesis) window.speechSynthesis.cancel(); } catch (e) {}
+    updateAudioSession();
   }
 
   function pause() {
@@ -1828,10 +1961,11 @@ window.addEventListener('unhandledrejection', function (e) {
      animation loop
      ========================================================= */
   function step() {
-    if (S.playing && S.actx && S.actx.state !== 'running' && S.actx.state !== 'closed') {
-      // iOS can suspend the context while the mic is open — bring it back
+    if ((S.playing || S.recording) && S.actx && S.actx.state !== 'running' && S.actx.state !== 'closed') {
+      // iOS suspends the context when the mic opens or the app goes to the
+      // background — keep pulling it back so BGM and voice stay audible
       var ms = Date.now();
-      if (!S._lastResume || ms - S._lastResume > 1500) {
+      if (!S._lastResume || ms - S._lastResume > 400) {
         S._lastResume = ms;
         try { S.actx.resume(); } catch (e) {}
       }
@@ -2083,8 +2217,12 @@ window.addEventListener('unhandledrejection', function (e) {
     }
 
     setStatus('마이크를 준비하는 중이에요…', 'info');
-    // iPhone: ask Safari to keep playing audio while the mic is open
-    try { if (navigator.audioSession) navigator.audioSession.type = 'play-and-record'; } catch (e) {}
+    // iPhone: "play-and-record" keeps the BGM and the partner's voice audible
+    // while the mic is open. The unlock happens here, inside the tap, before
+    // getUserMedia takes the context down.
+    S.recSession = true;
+    setAudioSessionType('play-and-record');
+    pingAudio();
     var stream = null;
     try {
       stream = await navigator.mediaDevices.getUserMedia({
@@ -2093,12 +2231,14 @@ window.addEventListener('unhandledrejection', function (e) {
       });
     } catch (e) {
       micError(e);
+      S.recSession = false;
+      updateAudioSession();
       return;
     }
 
     S.micStream = stream;
     initAudio();
-    try { if (S.actx.state !== 'running') await S.actx.resume(); } catch (e) {}
+    pingAudio();                       // right after getUserMedia: mic open, context back on
     try {
       S.micSrc = S.actx.createMediaStreamSource(stream);
       S.analyser = S.actx.createAnalyser();
@@ -2110,11 +2250,11 @@ window.addEventListener('unhandledrejection', function (e) {
 
     // iOS Safari suspends the AudioContext when getUserMedia opens the mic —
     // resume it again here, and have the partner's real voice ready to play
-    try { if (S.actx.state !== 'running') await S.actx.resume(); } catch (e) {}
-    if (S.tts) {
+    pingAudio();
+    if (S.tts && !aiReadyFor(SC)) {
       await Promise.race([loadAiFor(SC), new Promise(function (r) { setTimeout(r, 2500); })]);
-      try { if (S.actx.state !== 'running') await S.actx.resume(); } catch (e) {}
     }
+    pingAudio();
 
     if (S.playing) { S.playing = false; stopAudio(); }
     S.t = 0;
@@ -2123,7 +2263,15 @@ window.addEventListener('unhandledrejection', function (e) {
 
     if (S.countdown) {
       var go = await runCountdown(3);
-      if (!go) { stopMic(); setStatus('녹음을 취소했어요. 다시 준비되면 눌러 주세요.', 'info'); return; }
+      if (!go) {
+        S.recSession = false;
+        stopMic();
+        updateAudioSession();
+        setStatus('녹음을 취소했어요. 다시 준비되면 눌러 주세요.', 'info');
+        return;
+      }
+      // the countdown just finished in a timer: take the context back up
+      pingAudio();
     }
 
     var mime = pickMime();
@@ -2134,6 +2282,8 @@ window.addEventListener('unhandledrejection', function (e) {
       try { rec = new MediaRecorder(stream); } catch (e2) {
         setStatus('녹음기를 시작할 수 없어요: ' + ((e2 && e2.message) || 'unknown'), 'err');
         stopMic();
+        S.recSession = false;
+        updateAudioSession();
         return;
       }
     }
@@ -2154,26 +2304,32 @@ window.addEventListener('unhandledrejection', function (e) {
     } catch (e) {
       setStatus('녹음을 시작할 수 없어요: ' + (e.message || e), 'err');
       stopMic();
+      S.recSession = false;
+      updateAudioSession();
       return;
     }
 
     S.recording = true;
+    S.recSession = true;
     updateButtons();
     if (S.lastTurn >= 0) { applyTurn(S.lastTurn); }
-    setStatus('녹음 중이에요! 🎙️ “지금 말하세요!”가 뜰 때 대사를 말해 보세요. 배경음은 계속 흐르고 대사만 비어 있어요.', 'rec');
+    setStatus('녹음 중이에요! 🎙️ “지금 말하세요!”가 뜰 때 대사를 말해 보세요. 배경음과 AI 목소리는 계속 흐르고, 내 대사 자리만 비어 있어요.', 'rec');
     if (S.tts) micHint.textContent = '🎧 이어폰을 끼면 깔끔해요';
-    await play({ from: 0, voice: false });
+    pingAudio();
+    play({ from: 0, voice: false });
   }
 
   function endRecording() {
     if (!S.recording) return;
     S.recording = false;
+    S.recSession = false;
     if (S.playing) {
       S.t = clamp(nowT(), 0, S.duration);
       S.playing = false;
     }
-    stopAudio();
     try { if (S.rec && S.rec.state !== 'inactive') S.rec.stop(); } catch (e) {}
+    stopAudio();
+    updateAudioSession();
     updateButtons();
   }
 
@@ -2184,6 +2340,8 @@ window.addEventListener('unhandledrejection', function (e) {
     S.rec = null;
     stopMic();
     S.recording = false;
+    S.recSession = false;
+    updateAudioSession();
 
     if (blob.size < 900) {
       setStatus('녹음된 소리가 거의 없어요. 마이크 권한과 음량을 확인한 뒤 다시 시도해 주세요.', 'err');
@@ -2196,6 +2354,10 @@ window.addEventListener('unhandledrejection', function (e) {
     S.voiceURL = URL.createObjectURL(blob);
     S.voiceLoaded = false;
     if (S.voiceEl) { try { S.voiceEl.src = S.voiceURL; S.voiceLoaded = true; } catch (e) {} }
+    // decode the take once, so "합본 다시듣기" can play it inside the same
+    // AudioContext as the BGM and the partner's voice
+    S.voiceBuf = null;
+    decodeBlob(blob).then(function (buf) { S.voiceBuf = buf; }, function () { S.voiceBuf = null; });
 
     setStatus('녹음 완료! 🎧 “합본 다시듣기”로 내 목소리를 들어 보세요. 파일로 저장하고 싶으면 💾 저장하기를 눌러 주세요.', 'ok');
     updateButtons();
@@ -2463,8 +2625,9 @@ window.addEventListener('unhandledrejection', function (e) {
   function clearTake() {
     if (S.recording) endRecording();
     if (S.voiceEl) { try { S.voiceEl.pause(); } catch (e) {} }
+    stopVoiceNodes();
     if (S.voiceURL) { try { URL.revokeObjectURL(S.voiceURL); } catch (e) {} }
-    S.voiceBlob = null; S.voiceURL = null; S.voiceLoaded = false;
+    S.voiceBlob = null; S.voiceURL = null; S.voiceBuf = null; S.voiceLoaded = false;
     if (S.voiceEl) { try { S.voiceEl.removeAttribute('src'); S.voiceEl.load(); } catch (e) {} }
   }
 
@@ -2588,6 +2751,7 @@ window.addEventListener('unhandledrejection', function (e) {
     loadScenario(S.scenario, 'B', true);
   });
   btnRecord.addEventListener('click', function () {
+    unlockAudioSync();
     unlockTTS();
     startRecordingFlow().catch(function (e) {
       setStatus('녹음을 시작하지 못했어요: ' + ((e && e.message) || e), 'err');
@@ -2598,6 +2762,7 @@ window.addEventListener('unhandledrejection', function (e) {
   });
 
   btnPlay.addEventListener('click', function () {
+    unlockAudioSync();
     if (S.recording) return;
     if (S.playing) { pause(); return; }
     var from = (S.t >= S.duration - 0.05) ? 0 : S.t;
@@ -2606,6 +2771,7 @@ window.addEventListener('unhandledrejection', function (e) {
   });
 
   btnMix.addEventListener('click', function () {
+    unlockAudioSync();
     if (S.recording || !S.voiceURL) return;
     if (S.playing) { pause(); return; }
     tapUnlock(0);
@@ -2619,6 +2785,7 @@ window.addEventListener('unhandledrejection', function (e) {
   });
 
   bigPlay.addEventListener('click', function (ev) {
+    unlockAudioSync();
     ev.stopPropagation();
     if (S.recording) return;
     tapUnlock(0);
@@ -2628,15 +2795,17 @@ window.addEventListener('unhandledrejection', function (e) {
     if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); bigPlay.click(); }
   });
   idle.addEventListener('click', function () {
+    unlockAudioSync();
     if (S.recording) return;
     tapUnlock(0);
     play({ from: 0, voice: false }).catch(function () {});
   });
   // a tap on the scene itself also unlocks the barista voice (iOS)
-  stage.addEventListener('click', function () { unlockTTS(); });
+  stage.addEventListener('click', function () { unlockAudioSync(); unlockTTS(); });
 
   function seekFromEvent(ev) {
     if (S.recording) return;
+    unlockAudioSync();
     unlockTTS();
     var r = timeline.getBoundingClientRect();
     var x = (ev.touches && ev.touches[0] ? ev.touches[0].clientX : ev.clientX) - r.left;
@@ -2760,8 +2929,18 @@ window.addEventListener('unhandledrejection', function (e) {
     updateUI(0);
     updateButtons();
     tick();
-    // start fetching the partner voices in the background
+    // plain listening route on iPhone: comes out of the loudspeaker even with
+    // the side silent switch on, and stays loud for 샘플 재생 / 합본 다시듣기
+    setAudioSessionType('playback');
+    // start fetching and decoding the partner voices right away, so the first
+    // tap on 샘플 재생 / 녹음 시작 can start the sound synchronously
     loadAiFor(SC);
+    // any tap anywhere is enough to unlock the audio graph on iOS
+    if (window.PointerEvent) {
+      document.addEventListener('pointerdown', function () { unlockAudioSync(); }, { passive: true });
+    } else {
+      document.addEventListener('touchstart', function () { unlockAudioSync(); }, { passive: true });
+    }
     // safety net: keeps the transport and meters alive if rAF is throttled
     setInterval(step, 250);
     setStatus('준비됐어요. 🎙️ “녹음 시작”을 누르면 3초 뒤에 장면이 시작되고, 내 차례에 “지금 말하세요!”가 떠요.', 'info');
