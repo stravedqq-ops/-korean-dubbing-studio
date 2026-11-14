@@ -2295,6 +2295,8 @@ window.addEventListener('unhandledrejection', function (e) {
     ttsTip.innerHTML = sc.tipHtml;
     bgmNote.textContent = sc.bgmNote;
     ttsToggle.setAttribute('aria-label', sc.ttsTitle.replace(' (AI)', '') + ' 재생');
+    enSwitch.setAttribute('aria-label', sc.helperName);
+    enToggle.setAttribute('aria-label', sc.helperName);
 
     var hasRoles = !!sc.roles && !playing;
     roleRow.classList.toggle('show', hasRoles);
