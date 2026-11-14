@@ -338,6 +338,7 @@ body:not(.en-on) .en-only{display:none!important}
           <input type="range" id="micVol" min="0" max="100" value="100" aria-label="내 목소리 음량">
         </div>
         <div class="note">배경음은 카페 소음·잔잔한 코드·문 종소리·에스프레소 소리로 앱이 직접 만듭니다. 대사만 비어 있어요.</div>
+        <div class="tip">📱 아이폰에서는 측면 <b>무음 모드</b>를 해제해야 직원 목소리(TTS)가 들려요.<small class="en-only"> iPhone: turn off the side Silent switch to hear the barista voice.</small></div>
       </div>
 
       <div class="card">
@@ -1076,6 +1077,8 @@ window.addEventListener('unhandledrejection', function (e) {
 
   async function play(opts) {
     opts = opts || {};
+    var primed = (S._primeIdx != null) ? S._primeIdx : -1;
+    S._primeIdx = -1;
     initAudio();
     if (!S.actx) return;
     try { if (S.actx.state !== 'running') await S.actx.resume(); } catch (e) {}
@@ -1089,6 +1092,7 @@ window.addEventListener('unhandledrejection', function (e) {
     S.t = from;
     S.wallStart = performance.now();
     S.fired = {};
+    if (primed >= 0) S.fired[primed] = true;
     S.playing = true;
     S.wantVoice = !!opts.voice;
     idle.classList.add('hide');
@@ -1224,14 +1228,56 @@ window.addEventListener('unhandledrejection', function (e) {
   function pickVoice() {
     if (!window.speechSynthesis) return null;
     var vs = window.speechSynthesis.getVoices() || [];
-    for (var i = 0; i < vs.length; i++) {
-      if (/ko[-_]KR/i.test(vs[i].lang)) return vs[i];
+    var i;
+    for (i = 0; i < vs.length; i++) {
+      if (/ko[-_]KR/i.test(vs[i].lang || '')) return vs[i];
+    }
+    for (i = 0; i < vs.length; i++) {
+      if (/^ko([-_]|$)/i.test(vs[i].lang || '')) return vs[i];
     }
     return null;
   }
   if (window.speechSynthesis) {
     koVoice = pickVoice();
     window.speechSynthesis.onvoiceschanged = function () { koVoice = pickVoice(); };
+  }
+
+  /* iOS Safari only lets speechSynthesis start inside a real tap. Prime it from
+     every tap that can lead to a barista line, then speak() can run later from
+     the animation loop. */
+  function unlockTTS() {
+    if (!window.speechSynthesis) return;
+    try {
+      var syn = window.speechSynthesis;
+      syn.resume();
+      if (syn.speaking || syn.pending) return;   // already unlocked (or talking)
+      if (!koVoice) koVoice = pickVoice();
+      var u = new SpeechSynthesisUtterance(' ');
+      u.volume = 0;
+      u.lang = 'ko-KR';
+      window._ttsUnlock = u;
+      syn.speak(u);
+    } catch (e) {}
+  }
+
+  /* Speak the opening barista line right now, while we are still inside the tap.
+     Returns true when it spoke (so the caller can skip the silent unlock). */
+  function primeTurn(from) {
+    if (S.mode !== 'sample' || !S.tts) return false;
+    if (!(from < 0.2)) return false;
+    var idx = -1;
+    for (var i = 0; i < TURNS.length; i++) {
+      var tn = TURNS[i];
+      if (tn.who === 'staff' && from >= tn.t0 - 0.05 && from < tn.t1) { idx = i; break; }
+    }
+    if (idx < 0) return false;
+    speak(TURNS[idx].ko);
+    S._primeIdx = idx;      // play() marks it as fired so it never doubles
+    return true;
+  }
+
+  function tapUnlock(from) {
+    if (!primeTurn(from)) unlockTTS();
   }
 
   function maybeSpeak(t) {
@@ -1250,13 +1296,21 @@ window.addEventListener('unhandledrejection', function (e) {
   function speak(text) {
     if (!window.speechSynthesis) return;
     try {
-      window.speechSynthesis.cancel();
+      var syn = window.speechSynthesis;
+      if (!koVoice) koVoice = pickVoice();
+      // cancel() only when something is actually queued: on iOS an extra cancel
+      // right before speak() is what makes the line go silent
+      if (syn.speaking || syn.pending) syn.cancel();
       var u = new SpeechSynthesisUtterance(text);
       u.lang = 'ko-KR';
       u.rate = 0.94;
       u.pitch = 1.06;
+      u.volume = 1;
       if (koVoice) u.voice = koVoice;
-      window.speechSynthesis.speak(u);
+      // keep the utterance alive: iOS WebKit drops it if it gets garbage-collected
+      window._activeUtterance = u;
+      syn.resume();
+      syn.speak(u);
     } catch (e) {}
   }
 
@@ -1740,6 +1794,7 @@ window.addEventListener('unhandledrejection', function (e) {
      events
      ========================================================= */
   btnRecord.addEventListener('click', function () {
+    unlockTTS();
     startRecordingFlow().catch(function (e) {
       setStatus('녹음을 시작하지 못했어요: ' + ((e && e.message) || e), 'err');
       S.recording = false;
@@ -1752,12 +1807,14 @@ window.addEventListener('unhandledrejection', function (e) {
     if (S.recording) return;
     if (S.playing) { pause(); return; }
     var from = (S.t >= S.duration - 0.05) ? 0 : S.t;
+    tapUnlock(from);
     play({ from: from, voice: false }).catch(function () {});
   });
 
   btnMix.addEventListener('click', function () {
     if (S.recording || !S.voiceURL) return;
     if (S.playing) { pause(); return; }
+    tapUnlock(0);
     setStatus('🎧 배경음과 내 목소리를 함께 재생해요. 소리 조절 슬라이더로 균형을 맞춰 보세요.', 'info');
     play({ from: 0, voice: true }).catch(function () {});
   });
@@ -1770,15 +1827,23 @@ window.addEventListener('unhandledrejection', function (e) {
   bigPlay.addEventListener('click', function (ev) {
     ev.stopPropagation();
     if (S.recording) return;
+    tapUnlock(0);
     play({ from: 0, voice: false }).catch(function () {});
   });
   bigPlay.addEventListener('keydown', function (ev) {
     if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); bigPlay.click(); }
   });
-  idle.addEventListener('click', function () { if (!S.recording) play({ from: 0, voice: false }).catch(function () {}); });
+  idle.addEventListener('click', function () {
+    if (S.recording) return;
+    tapUnlock(0);
+    play({ from: 0, voice: false }).catch(function () {});
+  });
+  // a tap on the scene itself also unlocks the barista voice (iOS)
+  stage.addEventListener('click', function () { unlockTTS(); });
 
   function seekFromEvent(ev) {
     if (S.recording) return;
+    unlockTTS();
     var r = timeline.getBoundingClientRect();
     var x = (ev.touches && ev.touches[0] ? ev.touches[0].clientX : ev.clientX) - r.left;
     var ratio = clamp(x / r.width, 0, 1);
@@ -1818,6 +1883,7 @@ window.addEventListener('unhandledrejection', function (e) {
   ttsToggle.addEventListener('change', function () {
     S.tts = ttsToggle.checked;
     if (!S.tts) { try { window.speechSynthesis.cancel(); } catch (e) {} }
+    else unlockTTS();
   });
   cdToggle.addEventListener('change', function () { S.countdown = cdToggle.checked; });
 
