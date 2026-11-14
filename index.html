@@ -1639,6 +1639,14 @@ window.addEventListener('unhandledrejection', function (e) {
      animation loop
      ========================================================= */
   function step() {
+    if (S.playing && S.actx && S.actx.state !== 'running' && S.actx.state !== 'closed') {
+      // iOS can suspend the context while the mic is open — bring it back
+      var ms = Date.now();
+      if (!S._lastResume || ms - S._lastResume > 1500) {
+        S._lastResume = ms;
+        try { S.actx.resume(); } catch (e) {}
+      }
+    }
     if (S.playing && S.actx) {
       var t = nowT();
       if (S.mode === 'video' && S.video && S.video.readyState >= 2) {
